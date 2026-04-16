@@ -1,19 +1,28 @@
 # High Level Analyzer
-# For more information and documentation, please go to https://support.saleae.com/extensions/high-level-analyzer-extensions
+# For more information and documentation, please go to 
+# https://support.saleae.com/extensions/high-level-analyzer-extensions
 
 from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame, StringSetting, NumberSetting, ChoicesSetting
+
+# Lookup tables used during decode — defined once at module level
+_BUZ_TONE_NAMES = {0: 'No tone', 1: 'Off', 2: 'Default'}
+_LED_CTRL_TEMP  = {0: 'NOP', 1: 'Cancel', 2: 'Set timer'}
+_LED_CTRL_PERM  = {0: 'NOP', 1: 'Set'}
+_LED_COLORS     = {0: 'None', 1: 'Red', 2: 'Green', 3: 'Amber',
+                   4: 'Blue', 5: 'Magenta', 6: 'Cyan', 7: 'White'}
 
 
 # High level analyzers must subclass the HighLevelAnalyzer class.
 class OSDP_Analyzer(HighLevelAnalyzer):
 
     byte_cnt = 0            # byte counter for the current packet
-    pkt_start_time = None   # for storing packet start times for multibyte messages
+    pkt_start_time = None   # packet start times for multibyte messages
     pkt_len = 0             # current packet length
     pkt_crc = None          # if current packet has crc (or checksum)
     pkt_scb = None          # if current packet has Security Control Block
     pkt_cmd = None          # current command
-    tmp = None              # variable for temporary storage between decode() runnings
+    pkt_is_reply = False    # True if packet is a PD->CP reply
+    tmp = None              # temporary storage between decode() runnings
 
     # Console summary fields (assembled across bytes, printed at end of packet)
     pkt_addr_str = ''       # e.g. "CP->PD[0]"
@@ -32,7 +41,22 @@ class OSDP_Analyzer(HighLevelAnalyzer):
     # BUZ fields
     buz_info = ''           # assembled summary for console output
 
-    # An optional list of types this analyzer produces, providing a way to customize the way frames are displayed in Logic 2.
+    # LED fields
+    led_info = ''           # assembled summary for console output
+    led_num = 0             # LED number
+    led_temp_ctrl = ''      # temporary control code name
+    led_temp_on = 0         # temporary on_count in units of 100 ms
+    led_temp_off = 0        # temporary off_count in units of 100 ms
+    led_temp_on_col = ''    # temporary on_color name
+    led_temp_off_col = ''   # temporary off_color name
+    led_perm_ctrl = ''      # permanent control code name
+    led_perm_on = 0         # permanent on_count in units of 100 ms
+    led_perm_off = 0        # permanent off_count in units of 100 ms
+    led_perm_on_col = ''    # permanent on_color name
+    led_perm_off_col = ''   # permanent off_color name
+
+    # An optional list of types this analyzer produces, providing a way to 
+    # customize the way frames are displayed in Logic 2.
     result_types = {
         'OSDP': {
             'format': '{{data.string}}'
@@ -300,12 +324,14 @@ class OSDP_Analyzer(HighLevelAnalyzer):
             # HID H2004064 (Corporate 1000 48-bit)
             # Parity: bit 1 = even parity over pairs at every 3rd position; bit 0 = odd parity over bits 1-47
             cid = ex(bits, 2, 23)   # Company ID Code: bits 2-23 (22 bits)
-            cn  = ex(bits, 24, 46)  # Card Number: bits 24-46 (23 bits)
+            cn = ex(bits, 24, 46)  # Card Number: bits 24-46 (23 bits)
             ep1 = 0
             for i in range(3, 48):
                 if i % 3 == 0:
-                    if i < len(bits) and bits[i]:       ep1 += 1
-                    if i + 1 < len(bits) and bits[i+1]: ep1 += 1
+                    if i < len(bits) and bits[i]:
+                        ep1 += 1
+                    if i + 1 < len(bits) and bits[i+1]:
+                        ep1 += 1
             op1 = sum(bits[1:48])
             p1 = 'OK' if (bits[1] == ep1 % 2 and bits[0] == (1 - op1 % 2)) else 'Fail'
             results.append(f'H2004064-Corp1000(48b): CID={cid} CN={cn} P={p1}')
@@ -451,8 +477,7 @@ class OSDP_Analyzer(HighLevelAnalyzer):
     def decode(self, frame: AnalyzerFrame):
         try:
             ch = frame.data['data'][0]
-        except:
-            # Not an ASCII character
+        except (KeyError, IndexError, TypeError):
             return
 
         msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {})
@@ -463,17 +488,17 @@ class OSDP_Analyzer(HighLevelAnalyzer):
             else:
                 return
         elif self.byte_cnt == 1:
-            is_reply = bool(ch & 0x80)
+            self.pkt_is_reply = bool(ch & 0x80)
             raw_addr = ch & 0x7F
             if raw_addr == 0x7F:
                 addr_num = 'BC'
             else:
                 addr_num = str(raw_addr)
-            direction = 'PD->CP' if is_reply else 'CP->PD'
+            direction = 'PD->CP' if self.pkt_is_reply else 'CP->PD'
             self.pkt_addr_str = f'{direction}[{addr_num}]'
             addr = 'ADDR: '
             addr += 'BROADCAST' if raw_addr == 0x7F else str(raw_addr)
-            if is_reply:
+            if self.pkt_is_reply:
                 addr += ' REPLY'
             msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': addr})
         elif self.byte_cnt == 2:
@@ -509,12 +534,13 @@ class OSDP_Analyzer(HighLevelAnalyzer):
                 msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': str(self.byte_cnt + 1)})
             else:
                 if self.byte_cnt == 5:  # cmd/reply byte
-                    self.pkt_cmd = self.GetCmdReplyCode(ch)
+                    self.pkt_cmd = self.GetCmdReplyCode(ch, self.pkt_is_reply)
                     self.raw_decoded = ''
                     self.raw_data = None
                     self.kp_digits = ''
                     self.kp_digit_count = 0
                     self.buz_info = ''
+                    self.led_info = ''
                     msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': self.pkt_cmd})
                 else:
                     if self.pkt_crc and self.byte_cnt == (self.pkt_len - 2):
@@ -591,8 +617,6 @@ class OSDP_Analyzer(HighLevelAnalyzer):
                                 return
                             elif (self.byte_cnt % 3) == 2:
                                 msg = AnalyzerFrame('OSDP', self.pkt_start_time, frame.end_time, {'string': self.tmp})
-                            else:
-                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': 'PDCAP parsing error'})
                         elif self.pkt_cmd == 'LSTATR':
                             if ch == 0x00:
                                 msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': 'Normal'})
@@ -606,8 +630,7 @@ class OSDP_Analyzer(HighLevelAnalyzer):
                             if self.byte_cnt == 6:
                                 msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Reader: {ch}'})
                             elif self.byte_cnt == 7:
-                                tone_names = {0: 'No tone', 1: 'Off', 2: 'Default'}
-                                tone_str = tone_names.get(ch, f'Custom({ch})')
+                                tone_str = _BUZ_TONE_NAMES.get(ch, f'Custom({ch})')
                                 msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Tone: {tone_str}'})
                                 self.tmp = tone_str
                             elif self.byte_cnt == 8:
@@ -670,6 +693,72 @@ class OSDP_Analyzer(HighLevelAnalyzer):
                                     key = f'0x{ch:02X}'
                                 self.kp_digits += key
                                 msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Key: {key}'})
+                        elif self.pkt_cmd == 'LED':
+                            if self.byte_cnt == 6:
+                                self.led_info = ''
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Reader: {ch}'})
+                            elif self.byte_cnt == 7:
+                                self.led_num = ch
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'LED: {ch}'})
+                            elif self.byte_cnt == 8:
+                                self.led_temp_ctrl = _LED_CTRL_TEMP.get(ch, f'0x{ch:02X}')
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Temp ctrl: {self.led_temp_ctrl}'})
+                            elif self.byte_cnt == 9:
+                                self.led_temp_on = ch
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Temp ON: {ch * 100}ms'})
+                            elif self.byte_cnt == 10:
+                                self.led_temp_off = ch
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Temp OFF: {ch * 100}ms'})
+                            elif self.byte_cnt == 11:
+                                self.led_temp_on_col = _LED_COLORS.get(ch, f'0x{ch:02X}')
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Temp ON col: {self.led_temp_on_col}'})
+                            elif self.byte_cnt == 12:
+                                self.led_temp_off_col = _LED_COLORS.get(ch, f'0x{ch:02X}')
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Temp OFF col: {self.led_temp_off_col}'})
+                            elif self.byte_cnt == 13:
+                                # Low byte of 16-bit timer_count; span annotation across both bytes
+                                self.tmp = ch
+                                self.pkt_start_time = frame.start_time
+                                self.byte_cnt += 1
+                                return
+                            elif self.byte_cnt == 14:
+                                timer_ms = (self.tmp + (ch << 8)) * 100
+                                msg = AnalyzerFrame('OSDP', self.pkt_start_time, frame.end_time, {'string': f'Temp timer: {timer_ms}ms'})
+                                # Build temporary summary (omit detail when NOP)
+                                if self.led_temp_ctrl == 'NOP':
+                                    self.led_info = f'LED{self.led_num} Temp=NOP'
+                                else:
+                                    self.led_info = (f'LED{self.led_num} Temp={self.led_temp_ctrl}'
+                                                     f' T_ON={self.led_temp_on * 100}ms'
+                                                     f' T_OFF={self.led_temp_off * 100}ms'
+                                                     f' T_ON_col={self.led_temp_on_col}'
+                                                     f' T_OFF_col={self.led_temp_off_col}'
+                                                     f' T_timer={timer_ms}ms')
+                            elif self.byte_cnt == 15:
+                                perm_ctrl = _LED_CTRL_PERM.get(ch, f'0x{ch:02X}')
+                                self.led_perm_ctrl = perm_ctrl
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Perm ctrl: {perm_ctrl}'})
+                            elif self.byte_cnt == 16:
+                                self.led_perm_on = ch
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Perm ON: {ch * 100}ms'})
+                            elif self.byte_cnt == 17:
+                                self.led_perm_off = ch
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Perm OFF: {ch * 100}ms'})
+                            elif self.byte_cnt == 18:
+                                self.led_perm_on_col = _LED_COLORS.get(ch, f'0x{ch:02X}')
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Perm ON col: {self.led_perm_on_col}'})
+                            elif self.byte_cnt == 19:
+                                self.led_perm_off_col = _LED_COLORS.get(ch, f'0x{ch:02X}')
+                                # Append permanent summary (omit detail when NOP)
+                                if self.led_perm_ctrl == 'NOP':
+                                    self.led_info += ' Perm=NOP'
+                                else:
+                                    self.led_info += (f' Perm={self.led_perm_ctrl}'
+                                                      f' ON={self.led_perm_on * 100}ms'
+                                                      f' OFF={self.led_perm_off * 100}ms'
+                                                      f' ON_col={self.led_perm_on_col}'
+                                                      f' OFF_col={self.led_perm_off_col}')
+                                msg = AnalyzerFrame('OSDP', frame.start_time, frame.end_time, {'string': f'Perm OFF col: {self.led_perm_off_col}'})
 
         self.byte_cnt += 1
 
@@ -677,16 +766,21 @@ class OSDP_Analyzer(HighLevelAnalyzer):
             if self.pkt_len == self.byte_cnt:
                 # End of packet - print one-line console summary
                 card_info = f' | {self.raw_decoded}' if self.raw_decoded else ''
-                kp_info = f' | Keys({self.kp_digit_count}): "{self.kp_digits}"' if self.kp_digits else ''
-                buz_info = f' | {self.buz_info}' if self.buz_info else ''
-                print(f'[OSDP] {self.pkt_addr_str} {self.pkt_cmd} seq={self.pkt_sqn}{card_info}{kp_info}{buz_info}')
+                kp_info   = f' | Keys({self.kp_digit_count}): "{self.kp_digits}"' if self.kp_digits else ''
+                buz_info  = f' | {self.buz_info}' if self.buz_info else ''
+                led_info  = f' | {self.led_info}'  if self.led_info  else ''
+                print(f'[OSDP] {self.pkt_addr_str} {self.pkt_cmd} seq={self.pkt_sqn}{card_info}{kp_info}{buz_info}{led_info}')
                 self.pkt_len = 0
                 self.byte_cnt = 0
+                self.raw_decoded = ''
+                self.led_info = ''
+                self.buz_info = ''
+                self.kp_digits = ''
 
         return msg
 
 
-    def GetCmdReplyCode(self, cmd):
+    def GetCmdReplyCode(self, cmd, is_reply):
         # Commands                              # Meaning (Data)
         if cmd == 0x60:  return 'POLL'          # Poll (None)
         if cmd == 0x61:  return 'ID'            # ID Report Request (id type)
@@ -703,11 +797,11 @@ class OSDP_Analyzer(HighLevelAnalyzer):
         if cmd == 0x73:  return 'BIOREAD'       # Scan and Send Biometric Data (Requested Return Format)
         if cmd == 0x74:  return 'BIOMATCH'      # Scan and Match Biometric Template (Biometric Template)
         if cmd == 0x75:  return 'KEYSET'        # Encryption Key Set Command (Encryption Key)
-        if cmd == 0x76:  return 'CHLNG'         # Challenge and Secure Session Initialization Rq. (Challenge Data)
+        if cmd == 0x76 and not is_reply:  return 'CHLNG'    # Challenge and Secure Session Initialization Rq. (Challenge Data)
         if cmd == 0x77:  return 'SCRYPT'        # Server Cryptogram (Encryption Data)
         if cmd == 0x7B:  return 'ACURXSIZE'     # Max ACU receive size (Buffer size)
         if cmd == 0x7C:  return 'FILETRANSFER'  # Send data file to PD (File contents)
-        if cmd == 0x80:  return 'MFG'           # Manufacturer Specific Command (Any)
+        if cmd == 0x80 and not is_reply:  return 'MFG'      # Manufacturer Specific Command (Any)
         if cmd == 0xA1:  return 'XWR'           # Extended write data (APDU and details)
         if cmd == 0xA2:  return 'ABORT'         # Abort PD operation (None)
         if cmd == 0xA3:  return 'PIVDATA'       # Get PIV Data (Object details)
@@ -730,11 +824,11 @@ class OSDP_Analyzer(HighLevelAnalyzer):
         if cmd == 0x54:  return 'COM'           # PD Communications Configuration Report (Comm data)
         if cmd == 0x57:  return 'BIOREADR'      # Biometric Data (Biometric data)
         if cmd == 0x58:  return 'BIOMATCHR'     # Biometric Match Result (Result)
-        if cmd == 0x76:  return 'CCRYPT'        # Client's ID, Random Number, and Cryptogram (Encryption Data)
-        if cmd == 0x79:  return 'BUSY'          # PD is Busy reply
+        if cmd == 0x76 and is_reply:  return 'CCRYPT'       # Client's ID, Random Number, and Cryptogram (Encryption Data)
         if cmd == 0x78:  return 'RMAC_I'        # Initial R-MAC (Encryption Data)
+        if cmd == 0x79:  return 'BUSY'          # PD is Busy reply
         if cmd == 0x7A:  return 'FTSTAT'        # File transfer status (Status details)
-        if cmd == 0x80:  return 'PIVDATAR'      # PIV Data Reply (credential data)
+        if cmd == 0x80 and is_reply:  return 'PIVDATAR'     # PIV Data Reply (credential data)
         if cmd == 0x81:  return 'GENAUTHR'      # Authentication response (response details)
         if cmd == 0x82:  return 'CRAUTHR'       # Response to challenge (response details)
         if cmd == 0x83:  return 'MFGSTATR'      # MFG specific status (status details)
